@@ -1,3 +1,3 @@
-module github.com/MoYeRanqianzhi/LinuxDoSpace/sdk/go
+module github.com/MoYeRanqianzhi/LinuxDoSpaceGoSDK
 
 go 1.25

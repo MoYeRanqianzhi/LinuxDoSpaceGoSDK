@@ -15,7 +15,7 @@ This SDK follows `sdk/spec/MAIL_STREAM_PROTOCOL.md` and the current Python SDK s
 ## Install
 
 ```bash
-go get github.com/MoYeRanqianzhi/LinuxDoSpace/sdk/go
+go get github.com/MoYeRanqianzhi/LinuxDoSpaceGoSDK
 ```
 
 ## Quick start
@@ -28,7 +28,7 @@ import (
 	"fmt"
 	"time"
 
-	linuxdospace "github.com/MoYeRanqianzhi/LinuxDoSpace/sdk/go"
+	linuxdospace "github.com/MoYeRanqianzhi/LinuxDoSpaceGoSDK"
 )
 
 func main() {
@@ -92,3 +92,9 @@ for mail := range ch {
 - `*StreamError`
 
 These both implement `error`.
+
+## Protocol Reference
+
+The shared protocol reference lives in the main project repository:
+
+- `https://github.com/MoYeRanqianzhi/LinuxDoSpace/blob/main/sdk/spec/MAIL_STREAM_PROTOCOL.md`

@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/mail"
 	"net/textproto"
@@ -62,7 +63,9 @@ func WithConnectTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithSocketTimeout sets HTTP client timeout.
+// WithSocketTimeout sets the stream idle timeout budget used by callers and
+// custom clients. It is not applied as a total request lifetime timeout to the
+// built-in long-lived stream client.
 func WithSocketTimeout(timeout time.Duration) Option {
 	return func(o *clientOptions) error {
 		o.socketTimeout = timeout
@@ -286,7 +289,15 @@ func NewClient(token string, options ...Option) (*Client, error) {
 
 	httpClient := cfg.httpClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: cfg.socketTimeout}
+		httpClient = &http.Client{
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: cfg.connectTimeout}).DialContext,
+				ForceAttemptHTTP2:     true,
+				TLSHandshakeTimeout:   cfg.connectTimeout,
+				ResponseHeaderTimeout: cfg.connectTimeout,
+			},
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -319,16 +330,15 @@ func NewClient(token string, options ...Option) (*Client, error) {
 func (c *Client) Listen(ctx context.Context) (<-chan MailMessage, func()) {
 	ch := make(chan MailMessage, listenerBufferSize)
 	c.mu.Lock()
-	id := c.nextListenerID
-	c.nextListenerID++
-	closed := c.closed
-	c.allListeners[id] = ch
-	c.mu.Unlock()
-
-	if closed {
+	if c.closed || c.fatalErr != nil {
+		c.mu.Unlock()
 		close(ch)
 		return ch, func() {}
 	}
+	id := c.nextListenerID
+	c.nextListenerID++
+	c.allListeners[id] = ch
+	c.mu.Unlock()
 
 	stop := func() {
 		c.mu.Lock()
@@ -355,6 +365,9 @@ func (c *Client) Listen(ctx context.Context) (<-chan MailMessage, func()) {
 
 // BindExact binds one exact prefix+suffix mailbox rule.
 func (c *Client) BindExact(prefix string, suffix Suffix, allowOverlap bool) (*Mailbox, error) {
+	if err := c.ensureUsable(); err != nil {
+		return nil, err
+	}
 	normalizedPrefix := strings.ToLower(strings.TrimSpace(prefix))
 	normalizedSuffix := strings.ToLower(strings.TrimSpace(string(suffix)))
 	if normalizedPrefix == "" {
@@ -384,6 +397,9 @@ func (c *Client) BindExact(prefix string, suffix Suffix, allowOverlap bool) (*Ma
 
 // BindPattern binds one regex+suffix mailbox rule.
 func (c *Client) BindPattern(pattern string, suffix Suffix, allowOverlap bool) (*Mailbox, error) {
+	if err := c.ensureUsable(); err != nil {
+		return nil, err
+	}
 	normalizedPattern := strings.TrimSpace(pattern)
 	normalizedSuffix := strings.ToLower(strings.TrimSpace(string(suffix)))
 	if normalizedPattern == "" {
@@ -417,6 +433,9 @@ func (c *Client) BindPattern(pattern string, suffix Suffix, allowOverlap bool) (
 
 // Route resolves current local mailbox matches for message.Address.
 func (c *Client) Route(message MailMessage) []*Mailbox {
+	if err := c.ensureUsable(); err != nil {
+		return nil
+	}
 	bindings := c.matchBindings(message.Address)
 	if len(bindings) == 0 {
 		return nil
@@ -479,9 +498,7 @@ func (c *Client) streamLoop() {
 		}
 		var authErr *AuthenticationError
 		if errors.As(err, &authErr) {
-			c.mu.Lock()
-			c.fatalErr = err
-			c.mu.Unlock()
+			c.failFatal(err)
 			return
 		}
 
@@ -492,6 +509,43 @@ func (c *Client) streamLoop() {
 			timer.Stop()
 			return
 		}
+	}
+}
+
+func (c *Client) failFatal(err error) {
+	c.mu.Lock()
+	if c.fatalErr != nil {
+		c.mu.Unlock()
+		return
+	}
+	c.fatalErr = err
+	c.closed = true
+	c.cancel()
+	if c.activeResp != nil {
+		_ = c.activeResp.Close()
+		c.activeResp = nil
+	}
+
+	fullListeners := make([]chan MailMessage, 0, len(c.allListeners))
+	for _, ch := range c.allListeners {
+		fullListeners = append(fullListeners, ch)
+	}
+	c.allListeners = map[int]chan MailMessage{}
+
+	unique := map[*Mailbox]struct{}{}
+	for _, chain := range c.bindings {
+		for _, binding := range chain {
+			unique[binding.mailbox] = struct{}{}
+		}
+	}
+	c.bindings = map[string][]*mailBinding{}
+	c.mu.Unlock()
+
+	for _, ch := range fullListeners {
+		close(ch)
+	}
+	for mailbox := range unique {
+		mailbox.forceCloseByClient()
 	}
 }
 
@@ -683,6 +737,18 @@ func (c *Client) isClosed() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.closed
+}
+
+func (c *Client) ensureUsable() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.fatalErr != nil {
+		return c.fatalErr
+	}
+	if c.closed {
+		return errors.New("client is closed")
+	}
+	return nil
 }
 
 func splitAddress(address string) (localPart string, suffix string, ok bool) {
