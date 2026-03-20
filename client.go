@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -95,6 +96,7 @@ type Client struct {
 
 	baseURL        string
 	httpClient     *http.Client
+	socketTimeout  time.Duration
 	reconnectDelay time.Duration
 
 	ctx    context.Context
@@ -108,6 +110,7 @@ type Client struct {
 	nextListenerID int
 	bindings       map[string][]*mailBinding
 	activeResp     io.Closer
+	dropped        atomic.Uint64
 }
 
 type mailBinding struct {
@@ -144,6 +147,7 @@ type Mailbox struct {
 	closed   bool
 	active   bool
 	listener chan MailMessage
+	dropped  atomic.Uint64
 }
 
 // Mode reports binding mode: exact or pattern.
@@ -171,6 +175,22 @@ func (m *Mailbox) Closed() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.closed
+}
+
+// Err exposes the terminal client error that closed this mailbox, if any.
+func (m *Mailbox) Err() error {
+	if m == nil || m.client == nil {
+		return nil
+	}
+	return m.client.Err()
+}
+
+// Dropped reports how many messages were dropped because the mailbox listener queue was full.
+func (m *Mailbox) Dropped() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.dropped.Load()
 }
 
 // Listen starts mailbox-level consumption and returns a message channel.
@@ -211,6 +231,7 @@ func (m *Mailbox) enqueue(msg MailMessage) {
 	select {
 	case m.listener <- msg:
 	default:
+		m.dropped.Add(1)
 	}
 }
 
@@ -249,6 +270,12 @@ type streamEvent struct {
 	OriginalRecipients   []string `json:"original_recipients"`
 	ReceivedAt           string   `json:"received_at"`
 	RawMessageBase64     string   `json:"raw_message_base64"`
+}
+
+type streamReadResult struct {
+	line []byte
+	err  error
+	eof  bool
 }
 
 // NewClient creates one client and performs initial connection attempt.
@@ -305,6 +332,7 @@ func NewClient(token string, options ...Option) (*Client, error) {
 		token:          normalizedToken,
 		baseURL:        baseURL,
 		httpClient:     httpClient,
+		socketTimeout:  cfg.socketTimeout,
 		reconnectDelay: cfg.reconnectDelay,
 		ctx:            ctx,
 		cancel:         cancel,
@@ -361,6 +389,18 @@ func (c *Client) Listen(ctx context.Context) (<-chan MailMessage, func()) {
 		}
 	}()
 	return ch, stop
+}
+
+// Err exposes the terminal fatal stream error, if the client stopped because of one.
+func (c *Client) Err() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.fatalErr
+}
+
+// Dropped reports how many full-stream messages were dropped because listener queues were full.
+func (c *Client) Dropped() uint64 {
+	return c.dropped.Load()
 }
 
 // BindExact binds one exact prefix+suffix mailbox rule.
@@ -493,8 +533,11 @@ func (c *Client) streamLoop() {
 			return
 		}
 		err := c.consumeOnce(c.ctx)
-		if err == nil || c.isClosed() {
+		if c.isClosed() {
 			return
+		}
+		if err == nil {
+			err = &StreamError{Message: "mail stream ended and will reconnect"}
 		}
 		var authErr *AuthenticationError
 		if errors.As(err, &authErr) {
@@ -638,34 +681,72 @@ func (c *Client) consumeOnce(ctx context.Context) error {
 
 	scanner := bufio.NewScanner(response.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxToken)
+	readCh := make(chan streamReadResult, 1)
+	go func() {
+		defer close(readCh)
+		for scanner.Scan() {
+			line := append([]byte(nil), bytes.TrimSpace(scanner.Bytes())...)
+			readCh <- streamReadResult{line: line}
+		}
+		if err := scanner.Err(); err != nil {
+			readCh <- streamReadResult{err: &StreamError{Message: "mail stream scanner error", Cause: err}}
+			return
+		}
+		readCh <- streamReadResult{eof: true}
+	}()
 
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
+	idleTimer := time.NewTimer(c.socketTimeout)
+	defer idleTimer.Stop()
+	resetIdleTimer := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
 		}
-		event := streamEvent{}
-		if err := json.Unmarshal(line, &event); err != nil {
-			return &StreamError{Message: "received invalid NDJSON event", Cause: err}
-		}
-		if event.Type == "ready" || event.Type == "heartbeat" {
-			continue
-		}
-		if event.Type != "mail" {
-			continue
-		}
-		messages, err := parseMailEvent(event)
-		if err != nil {
-			return err
-		}
-		for _, message := range messages {
-			c.dispatchMessage(message)
+		idleTimer.Reset(c.socketTimeout)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-idleTimer.C:
+			_ = response.Body.Close()
+			return &StreamError{Message: "mail stream stalled and will reconnect"}
+		case result, ok := <-readCh:
+			if !ok {
+				return nil
+			}
+			if result.err != nil {
+				return result.err
+			}
+			if result.eof {
+				return nil
+			}
+			resetIdleTimer()
+			if len(result.line) == 0 {
+				continue
+			}
+			event := streamEvent{}
+			if err := json.Unmarshal(result.line, &event); err != nil {
+				return &StreamError{Message: "received invalid NDJSON event", Cause: err}
+			}
+			if event.Type == "ready" || event.Type == "heartbeat" {
+				continue
+			}
+			if event.Type != "mail" {
+				continue
+			}
+			messages, err := parseMailEvent(event)
+			if err != nil {
+				return err
+			}
+			for _, message := range messages {
+				c.dispatchMessage(message)
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return &StreamError{Message: "mail stream scanner error", Cause: err}
-	}
-	return nil
 }
 
 func (c *Client) dispatchMessage(message MailMessage) {
@@ -680,6 +761,7 @@ func (c *Client) dispatchMessage(message MailMessage) {
 		select {
 		case ch <- message:
 		default:
+			c.dropped.Add(1)
 		}
 	}
 	for _, binding := range c.matchBindings(message.Address) {

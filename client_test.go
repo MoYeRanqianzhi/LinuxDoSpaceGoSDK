@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -125,6 +128,106 @@ func TestMailboxNoBackfillBeforeListen(t *testing.T) {
 	}
 }
 
+func TestClientReconnectsAfterGracefulEOFAndExposesFatalErr(t *testing.T) {
+	transport := &sequentialRoundTripper{
+		responses: []roundTripResponse{
+			streamRoundTripResponse(http.StatusOK, `{"type":"ready","token_public_id":"tok123"}`+"\n"),
+			streamRoundTripResponse(http.StatusOK, `{"type":"ready","token_public_id":"tok123"}`+"\n"),
+			streamRoundTripResponse(http.StatusUnauthorized, "token rejected"),
+		},
+	}
+	httpClient := &http.Client{Transport: transport}
+
+	client, err := NewClient(
+		"token",
+		WithBaseURL("http://localhost:8787"),
+		WithHTTPClient(httpClient),
+		WithReconnectDelay(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if authErr, ok := client.Err().(*AuthenticationError); ok {
+			if authErr.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("unexpected auth status code: %d", authErr.StatusCode)
+			}
+			if transport.calls.Load() < 3 {
+				t.Fatalf("expected reconnect attempt before fatal auth, calls=%d", transport.calls.Load())
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected fatal auth error after reconnect, calls=%d, err=%v", transport.calls.Load(), client.Err())
+}
+
+func TestDroppedCountersExposeBackpressureLoss(t *testing.T) {
+	server := newFakeStreamServer(t)
+	defer server.close()
+
+	client, err := NewClient("token", WithBaseURL(server.baseURL()))
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+	if !server.waitForSubscribers(2, 2*time.Second) {
+		t.Fatal("stream subscriber was not ready")
+	}
+
+	allCtx, allCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer allCancel()
+	allCh, stopAll := client.Listen(allCtx)
+	defer stopAll()
+
+	mailbox, err := client.BindExact("alice", SuffixLinuxdoSpace, false)
+	if err != nil {
+		t.Fatalf("bind exact: %v", err)
+	}
+	defer mailbox.Close()
+
+	boxCtx, boxCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer boxCancel()
+	boxCh, err := mailbox.Listen(boxCtx)
+	if err != nil {
+		t.Fatalf("mailbox listen: %v", err)
+	}
+
+	// Fill both queues beyond their fixed buffer size without consuming from them yet.
+	for i := 0; i < listenerBufferSize*8; i++ {
+		server.publish("alice@linuxdo.space", rawRFC822("alice@linuxdo.space", "load"))
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	if client.Dropped() == 0 {
+		t.Fatal("expected full-stream dropped counter to increase")
+	}
+	if mailbox.Dropped() == 0 {
+		t.Fatal("expected mailbox dropped counter to increase")
+	}
+
+	// Drain and release resources so the close path remains clean.
+drainAll:
+	for {
+		select {
+		case <-allCh:
+		default:
+			break drainAll
+		}
+	}
+drainBox:
+	for {
+		select {
+		case <-boxCh:
+		default:
+			break drainBox
+		}
+	}
+}
+
 type fakeStreamServer struct {
 	server      *httptest.Server
 	subscribers chan chan []byte
@@ -237,4 +340,43 @@ func encodeEvent(payload map[string]any) []byte {
 
 func rawRFC822(recipient string, subject string) []byte {
 	return []byte("From: sender@example.com\r\nTo: " + recipient + "\r\nSubject: " + subject + "\r\n\r\nHello")
+}
+
+type roundTripResponse struct {
+	statusCode int
+	body       string
+}
+
+type sequentialRoundTripper struct {
+	calls     atomic.Int32
+	mu        sync.Mutex
+	responses []roundTripResponse
+}
+
+func (s *sequentialRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	s.calls.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.responses) == 0 {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	}
+	response := s.responses[0]
+	s.responses = s.responses[1:]
+	return &http.Response{
+		StatusCode: response.statusCode,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(response.body)),
+	}, nil
+}
+
+func streamRoundTripResponse(statusCode int, body string) roundTripResponse {
+	return roundTripResponse{
+		statusCode: statusCode,
+		body:       body,
+	}
 }

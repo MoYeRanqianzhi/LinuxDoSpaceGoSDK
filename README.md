@@ -2,7 +2,7 @@
 
 `linuxdospace-go` is the Go SDK for LinuxDoSpace token mail streaming.
 
-This SDK follows `sdk/spec/MAIL_STREAM_PROTOCOL.md` and the current Python SDK semantics:
+This SDK follows the shared protocol reference and the current Python SDK semantics:
 
 - one `Client` keeps one upstream stream to `/v1/token/email/stream`
 - `Listen` receives all mail events for the token
@@ -79,11 +79,15 @@ for mail := range ch {
 
 - `NewClient(token string, options ...Option) (*Client, error)`
 - `(*Client).Listen(ctx context.Context) (<-chan MailMessage, func())`
+- `(*Client).Err() error`
+- `(*Client).Dropped() uint64`
 - `(*Client).BindExact(prefix string, suffix Suffix, allowOverlap bool) (*Mailbox, error)`
 - `(*Client).BindPattern(pattern string, suffix Suffix, allowOverlap bool) (*Mailbox, error)`
 - `(*Client).Route(message MailMessage) []*Mailbox`
 - `(*Client).Close() error`
 - `(*Mailbox).Listen(ctx context.Context) (<-chan MailMessage, error)`
+- `(*Mailbox).Err() error`
+- `(*Mailbox).Dropped() uint64`
 - `(*Mailbox).Close()`
 
 ## Error types
@@ -98,3 +102,8 @@ These both implement `error`.
 The shared protocol reference lives in the main project repository:
 
 - `https://github.com/MoYeRanqianzhi/LinuxDoSpace/blob/main/sdk/spec/MAIL_STREAM_PROTOCOL.md`
+
+## Observability
+
+- `Err()` lets callers inspect the terminal fatal error after a listener channel closes.
+- `Dropped()` exposes backpressure drops for full listener queues and mailbox queues.
