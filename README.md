@@ -12,6 +12,11 @@ This SDK follows the shared protocol reference and the current Python SDK semant
 - `AllowOverlap=true` continues matching later bindings
 - mailbox queues activate only while mailbox listen is active
 
+Important:
+
+- `SuffixLinuxdoSpace` is semantic, not literal
+- the SDK resolves it to `<owner_username>.linuxdo.space` after `ready.owner_username`
+
 ## Install
 
 ```bash

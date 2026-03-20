@@ -109,6 +109,7 @@ type Client struct {
 	allListeners   map[int]chan MailMessage
 	nextListenerID int
 	bindings       map[string][]*mailBinding
+	ownerUsername  string
 	activeResp     io.Closer
 	dropped        atomic.Uint64
 }
@@ -266,6 +267,7 @@ func (m *Mailbox) Close() {
 type streamEvent struct {
 	Type string `json:"type"`
 
+	OwnerUsername        string   `json:"owner_username"`
 	OriginalEnvelopeFrom string   `json:"original_envelope_from"`
 	OriginalRecipients   []string `json:"original_recipients"`
 	ReceivedAt           string   `json:"received_at"`
@@ -409,12 +411,12 @@ func (c *Client) BindExact(prefix string, suffix Suffix, allowOverlap bool) (*Ma
 		return nil, err
 	}
 	normalizedPrefix := strings.ToLower(strings.TrimSpace(prefix))
-	normalizedSuffix := strings.ToLower(strings.TrimSpace(string(suffix)))
+	normalizedSuffix, err := c.resolveBindingSuffix(suffix)
 	if normalizedPrefix == "" {
 		return nil, errors.New("prefix must not be empty")
 	}
-	if normalizedSuffix == "" {
-		return nil, errors.New("suffix must not be empty")
+	if err != nil {
+		return nil, err
 	}
 
 	mailbox := &Mailbox{
@@ -441,12 +443,12 @@ func (c *Client) BindPattern(pattern string, suffix Suffix, allowOverlap bool) (
 		return nil, err
 	}
 	normalizedPattern := strings.TrimSpace(pattern)
-	normalizedSuffix := strings.ToLower(strings.TrimSpace(string(suffix)))
+	normalizedSuffix, err := c.resolveBindingSuffix(suffix)
 	if normalizedPattern == "" {
 		return nil, errors.New("pattern must not be empty")
 	}
-	if normalizedSuffix == "" {
-		return nil, errors.New("suffix must not be empty")
+	if err != nil {
+		return nil, err
 	}
 	compiled, err := regexp.Compile("^" + normalizedPattern + "$")
 	if err != nil {
@@ -633,8 +635,19 @@ func (c *Client) initialConnect(ctx context.Context) error {
 		if err := json.Unmarshal(line, &event); err != nil {
 			return &StreamError{Message: "received invalid NDJSON event during initial connect", Cause: err}
 		}
-		// Any valid event means the stream is alive and protocol is working.
-		return nil
+		switch event.Type {
+		case "heartbeat":
+			continue
+		case "ready":
+			if err := c.handleReadyEvent(event); err != nil {
+				return err
+			}
+			return nil
+		default:
+			return &StreamError{
+				Message: fmt.Sprintf("initial mail stream did not start with ready event, got %q", strings.TrimSpace(event.Type)),
+			}
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return &StreamError{Message: "initial mail stream scanner error", Cause: err}
@@ -732,7 +745,13 @@ func (c *Client) consumeOnce(ctx context.Context) error {
 			if err := json.Unmarshal(result.line, &event); err != nil {
 				return &StreamError{Message: "received invalid NDJSON event", Cause: err}
 			}
-			if event.Type == "ready" || event.Type == "heartbeat" {
+			if event.Type == "ready" {
+				if err := c.handleReadyEvent(event); err != nil {
+					return err
+				}
+				continue
+			}
+			if event.Type == "heartbeat" {
 				continue
 			}
 			if event.Type != "mail" {
@@ -813,6 +832,37 @@ func (c *Client) unregisterMailbox(mailbox *Mailbox) {
 		}
 		c.bindings[suffix] = filtered
 	}
+}
+
+func (c *Client) handleReadyEvent(event streamEvent) error {
+	ownerUsername := strings.ToLower(strings.TrimSpace(event.OwnerUsername))
+	if ownerUsername == "" {
+		return &StreamError{Message: "ready event did not include owner_username"}
+	}
+
+	c.mu.Lock()
+	c.ownerUsername = ownerUsername
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) resolveBindingSuffix(suffix Suffix) (string, error) {
+	normalizedSuffix := strings.ToLower(strings.TrimSpace(string(suffix)))
+	if normalizedSuffix == "" {
+		return "", errors.New("suffix must not be empty")
+	}
+	if normalizedSuffix != strings.ToLower(string(SuffixLinuxdoSpace)) {
+		return normalizedSuffix, nil
+	}
+
+	c.mu.RLock()
+	ownerUsername := c.ownerUsername
+	c.mu.RUnlock()
+	ownerUsername = strings.ToLower(strings.TrimSpace(ownerUsername))
+	if ownerUsername == "" {
+		return "", errors.New("stream bootstrap did not provide owner_username required to resolve SuffixLinuxdoSpace")
+	}
+	return ownerUsername + "." + normalizedSuffix, nil
 }
 
 func (c *Client) isClosed() bool {

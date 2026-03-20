@@ -6,7 +6,11 @@ import "time"
 type Suffix string
 
 const (
-	// SuffixLinuxdoSpace is the current first-party suffix.
+	// SuffixLinuxdoSpace is the first-party LinuxDoSpace namespace suffix.
+	//
+	// This value is semantic rather than literal: SDK bindings resolve it to the
+	// current token owner's namespace suffix `<owner_username>.linuxdo.space`
+	// after the stream handshake receives `ready.owner_username`.
 	SuffixLinuxdoSpace Suffix = "linuxdo.space"
 )
 

@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+const (
+	testOwnerUsername = "testuser"
+	testNamespace     = testOwnerUsername + ".linuxdo.space"
+)
+
 func TestRejectsNonLocalHTTPBaseURL(t *testing.T) {
 	_, err := NewClient("token", WithBaseURL("http://example.com"))
 	if err == nil {
@@ -58,7 +63,7 @@ func TestOrderedMatchingAndAllowOverlap(t *testing.T) {
 		t.Fatalf("alice listen: %v", err)
 	}
 
-	server.publish("alice@linuxdo.space", rawRFC822("alice@linuxdo.space", "hello"))
+	server.publish("alice@"+testNamespace, rawRFC822("alice@"+testNamespace, "hello"))
 
 	select {
 	case <-catchCh:
@@ -99,7 +104,7 @@ func TestMailboxNoBackfillBeforeListen(t *testing.T) {
 	allCh, stopAll := client.Listen(allCtx)
 	defer stopAll()
 
-	server.publish("alice@linuxdo.space", rawRFC822("alice@linuxdo.space", "before"))
+	server.publish("alice@"+testNamespace, rawRFC822("alice@"+testNamespace, "before"))
 	select {
 	case got := <-allCh:
 		if got.Subject != "before" {
@@ -116,7 +121,7 @@ func TestMailboxNoBackfillBeforeListen(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 
-	server.publish("alice@linuxdo.space", rawRFC822("alice@linuxdo.space", "after"))
+	server.publish("alice@"+testNamespace, rawRFC822("alice@"+testNamespace, "after"))
 
 	select {
 	case item := <-ch:
@@ -131,8 +136,8 @@ func TestMailboxNoBackfillBeforeListen(t *testing.T) {
 func TestClientReconnectsAfterGracefulEOFAndExposesFatalErr(t *testing.T) {
 	transport := &sequentialRoundTripper{
 		responses: []roundTripResponse{
-			streamRoundTripResponse(http.StatusOK, `{"type":"ready","token_public_id":"tok123"}`+"\n"),
-			streamRoundTripResponse(http.StatusOK, `{"type":"ready","token_public_id":"tok123"}`+"\n"),
+			streamRoundTripResponse(http.StatusOK, `{"type":"ready","token_public_id":"tok123","owner_username":"`+testOwnerUsername+`"}`+"\n"),
+			streamRoundTripResponse(http.StatusOK, `{"type":"ready","token_public_id":"tok123","owner_username":"`+testOwnerUsername+`"}`+"\n"),
 			streamRoundTripResponse(http.StatusUnauthorized, "token rejected"),
 		},
 	}
@@ -197,8 +202,8 @@ func TestDroppedCountersExposeBackpressureLoss(t *testing.T) {
 	}
 
 	// Fill both queues beyond their fixed buffer size without consuming from them yet.
-	for i := 0; i < listenerBufferSize*8; i++ {
-		server.publish("alice@linuxdo.space", rawRFC822("alice@linuxdo.space", "load"))
+	for i := 0; i < listenerBufferSize*32; i++ {
+		server.publish("alice@"+testNamespace, rawRFC822("alice@"+testNamespace, "load"))
 	}
 	time.Sleep(500 * time.Millisecond)
 
@@ -253,6 +258,7 @@ func newFakeStreamServer(t *testing.T) *fakeStreamServer {
 		_, _ = w.Write(encodeEvent(map[string]any{
 			"type":            "ready",
 			"token_public_id": "tok123",
+			"owner_username":  testOwnerUsername,
 		}))
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
