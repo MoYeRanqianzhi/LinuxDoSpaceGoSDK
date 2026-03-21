@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinuxDoSpace Go SDK"
+  short_description: "Use or maintain the LinuxDoSpace Go SDK"
+  default_prompt: "Use $linuxdo-space-go-sdk when writing consumer code against sdk/go or when updating the LinuxDoSpace Go SDK with matching docs and validation guidance."
