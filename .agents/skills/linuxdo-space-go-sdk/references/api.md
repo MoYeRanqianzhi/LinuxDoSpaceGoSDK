@@ -39,4 +39,3 @@
 - `Mailbox.Listen(ctx)` returns one channel and activates mailbox buffering only while active.
 - Regex bindings use full-match semantics.
 - `SuffixLinuxdoSpace` is semantic, not literal.
-

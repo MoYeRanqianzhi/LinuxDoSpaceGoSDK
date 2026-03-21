@@ -28,4 +28,3 @@ if err := client.Err(); err != nil {
     log.Println(err)
 }
 ```
-

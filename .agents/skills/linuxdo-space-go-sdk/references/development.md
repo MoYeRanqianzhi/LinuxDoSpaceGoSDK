@@ -35,4 +35,3 @@ go test -run TestMailboxNoBackfillBeforeListen ./...
 - `../../../client_test.go`
 - `../../../.github/workflows/ci.yml`
 - `../../../.github/workflows/release.yml`
-

@@ -56,4 +56,3 @@ for item := range ch {
 - `Err()` exposes fatal stream failure after listeners close.
 - `Dropped()` exposes backpressure drops.
 - `Route(message)` is local matching only.
-
