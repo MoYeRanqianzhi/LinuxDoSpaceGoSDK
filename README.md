@@ -15,7 +15,14 @@ This SDK follows the shared protocol reference and the current Python SDK semant
 Important:
 
 - `SuffixLinuxdoSpace` is semantic, not literal
-- the SDK resolves it to `<owner_username>.linuxdo.space` after `ready.owner_username`
+- `SuffixLinuxdoSpace` now resolves to the current token owner's canonical
+  mail namespace: `<owner_username>-mail.linuxdo.space`
+- `SuffixLinuxdoSpace.WithSuffix("foo")` resolves to
+  `<owner_username>-mailfoo.linuxdo.space`
+- active semantic `-mail<suffix>` registrations are synchronized to
+  `PUT /v1/token/email/filters`
+- the legacy default alias `<owner_username>.linuxdo.space` still matches the
+  default semantic binding automatically
 
 ## Install
 
@@ -78,6 +85,20 @@ if err != nil {
 for mail := range ch {
 	fmt.Println(mail.Address, mail.Subject)
 }
+```
+
+The same original semantic suffix also works for the current catch-all mail namespace:
+
+```go
+catchAllMailbox, err := client.BindPattern(
+	".*",
+	linuxdospace.SuffixLinuxdoSpace,
+	true,
+)
+if err != nil {
+	panic(err)
+}
+defer catchAllMailbox.Close()
 ```
 
 ## Public API

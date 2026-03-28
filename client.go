@@ -17,6 +17,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,8 @@ const (
 	DefaultBaseURL = "https://api.linuxdo.space"
 	// streamPath is the protocol-defined stream endpoint path.
 	streamPath = "/v1/token/email/stream"
+	// streamFiltersPath is the protocol-defined dynamic mailbox-filter endpoint.
+	streamFiltersPath = "/v1/token/email/filters"
 
 	defaultConnectTimeout = 10 * time.Second
 	defaultSocketTimeout  = 30 * time.Second
@@ -95,6 +98,7 @@ type Client struct {
 	token string
 
 	baseURL        string
+	connectTimeout time.Duration
 	httpClient     *http.Client
 	socketTimeout  time.Duration
 	reconnectDelay time.Duration
@@ -104,6 +108,9 @@ type Client struct {
 	wg     sync.WaitGroup
 
 	mu             sync.RWMutex
+	initialReadyCh chan struct{}
+	initialReadyOK bool
+	initialErr     error
 	closed         bool
 	fatalErr       error
 	allListeners   map[int]chan MailMessage
@@ -111,6 +118,8 @@ type Client struct {
 	bindings       map[string][]*mailBinding
 	ownerUsername  string
 	activeResp     io.Closer
+	filtersSynced  bool
+	filterSuffixes []string
 	dropped        atomic.Uint64
 }
 
@@ -333,26 +342,38 @@ func NewClient(token string, options ...Option) (*Client, error) {
 	client := &Client{
 		token:          normalizedToken,
 		baseURL:        baseURL,
+		connectTimeout: cfg.connectTimeout,
 		httpClient:     httpClient,
 		socketTimeout:  cfg.socketTimeout,
 		reconnectDelay: cfg.reconnectDelay,
 		ctx:            ctx,
 		cancel:         cancel,
+		initialReadyCh: make(chan struct{}),
 		allListeners:   map[int]chan MailMessage{},
 		bindings:       map[string][]*mailBinding{},
 	}
 
-	// Constructor must perform one immediate connection attempt.
-	initialCtx, initialCancel := context.WithTimeout(ctx, cfg.connectTimeout)
-	initialErr := client.initialConnect(initialCtx)
-	initialCancel()
-	if initialErr != nil {
-		cancel()
-		return nil, initialErr
-	}
-
 	client.wg.Add(1)
 	go client.streamLoop()
+	select {
+	case <-client.initialReadyCh:
+		client.mu.RLock()
+		initialOK := client.initialReadyOK
+		initialErr := client.initialErr
+		client.mu.RUnlock()
+		if !initialOK {
+			cancel()
+			client.wg.Wait()
+			if initialErr != nil {
+				return nil, initialErr
+			}
+			return nil, &StreamError{Message: "mail stream ended before ready event"}
+		}
+	case <-time.After(cfg.connectTimeout):
+		cancel()
+		client.wg.Wait()
+		return nil, &StreamError{Message: "timed out while opening LinuxDoSpace stream"}
+	}
 	return client, nil
 }
 
@@ -406,7 +427,9 @@ func (c *Client) Dropped() uint64 {
 }
 
 // BindExact binds one exact prefix+suffix mailbox rule.
-func (c *Client) BindExact(prefix string, suffix Suffix, allowOverlap bool) (*Mailbox, error) {
+//
+// `suffix` may be a `Suffix`, a `SemanticSuffix`, or one literal suffix string.
+func (c *Client) BindExact(prefix string, suffix any, allowOverlap bool) (*Mailbox, error) {
 	if err := c.ensureUsable(); err != nil {
 		return nil, err
 	}
@@ -433,12 +456,16 @@ func (c *Client) BindExact(prefix string, suffix Suffix, allowOverlap bool) (*Ma
 		prefix:       normalizedPrefix,
 		mailbox:      mailbox,
 	}
-	c.registerBinding(binding)
+	if err := c.registerBinding(binding); err != nil {
+		return nil, err
+	}
 	return mailbox, nil
 }
 
 // BindPattern binds one regex+suffix mailbox rule.
-func (c *Client) BindPattern(pattern string, suffix Suffix, allowOverlap bool) (*Mailbox, error) {
+//
+// `suffix` may be a `Suffix`, a `SemanticSuffix`, or one literal suffix string.
+func (c *Client) BindPattern(pattern string, suffix any, allowOverlap bool) (*Mailbox, error) {
 	if err := c.ensureUsable(); err != nil {
 		return nil, err
 	}
@@ -469,7 +496,9 @@ func (c *Client) BindPattern(pattern string, suffix Suffix, allowOverlap bool) (
 		pattern:      compiled,
 		mailbox:      mailbox,
 	}
-	c.registerBinding(binding)
+	if err := c.registerBinding(binding); err != nil {
+		return nil, err
+	}
 	return mailbox, nil
 }
 
@@ -530,6 +559,7 @@ func (c *Client) Close() error {
 
 func (c *Client) streamLoop() {
 	defer c.wg.Done()
+	initialAttempt := true
 	for {
 		if c.isClosed() {
 			return
@@ -539,13 +569,23 @@ func (c *Client) streamLoop() {
 			return
 		}
 		if err == nil {
+			if initialAttempt {
+				c.signalInitialReady(false, &StreamError{Message: "mail stream ended before ready event"})
+			}
 			err = &StreamError{Message: "mail stream ended and will reconnect"}
 		}
 		var authErr *AuthenticationError
 		if errors.As(err, &authErr) {
+			if initialAttempt {
+				c.signalInitialReady(false, err)
+			}
 			c.failFatal(err)
 			return
 		}
+		if initialAttempt {
+			c.signalInitialReady(false, err)
+		}
+		initialAttempt = false
 
 		timer := time.NewTimer(c.reconnectDelay)
 		select {
@@ -592,67 +632,6 @@ func (c *Client) failFatal(err error) {
 	for mailbox := range unique {
 		mailbox.forceCloseByClient()
 	}
-}
-
-// initialConnect validates token/auth/stream contract during constructor.
-//
-// It intentionally reads only enough data to prove the stream is healthy, then
-// returns so NewClient does not block on an endless stream.
-func (c *Client) initialConnect(ctx context.Context) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+streamPath, nil)
-	if err != nil {
-		return &StreamError{Message: "failed to build initial stream request", Cause: err}
-	}
-	request.Header.Set("Authorization", "Bearer "+c.token)
-	request.Header.Set("Accept", "application/x-ndjson")
-
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return &StreamError{Message: "failed to open initial mail stream", Cause: err}
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return &AuthenticationError{StatusCode: response.StatusCode, Message: strings.TrimSpace(string(body))}
-	}
-	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return &StreamError{
-			Message: fmt.Sprintf("unexpected stream status code: %d", response.StatusCode),
-			Cause:   errors.New(strings.TrimSpace(string(body))),
-		}
-	}
-
-	scanner := bufio.NewScanner(response.Body)
-	scanner.Buffer(make([]byte, 0, 8*1024), 256*1024)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		event := streamEvent{}
-		if err := json.Unmarshal(line, &event); err != nil {
-			return &StreamError{Message: "received invalid NDJSON event during initial connect", Cause: err}
-		}
-		switch event.Type {
-		case "heartbeat":
-			continue
-		case "ready":
-			if err := c.handleReadyEvent(event); err != nil {
-				return err
-			}
-			return nil
-		default:
-			return &StreamError{
-				Message: fmt.Sprintf("initial mail stream did not start with ready event, got %q", strings.TrimSpace(event.Type)),
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return &StreamError{Message: "initial mail stream scanner error", Cause: err}
-	}
-	return &StreamError{Message: "initial mail stream ended before handshake event"}
 }
 
 func (c *Client) consumeOnce(ctx context.Context) error {
@@ -757,13 +736,11 @@ func (c *Client) consumeOnce(ctx context.Context) error {
 			if event.Type != "mail" {
 				continue
 			}
-			messages, err := parseMailEvent(event)
+			message, err := parseMailEvent(event)
 			if err != nil {
 				return err
 			}
-			for _, message := range messages {
-				c.dispatchMessage(message)
-			}
+			c.dispatchMessage(message)
 		}
 	}
 }
@@ -783,8 +760,21 @@ func (c *Client) dispatchMessage(message MailMessage) {
 			c.dropped.Add(1)
 		}
 	}
-	for _, binding := range c.matchBindings(message.Address) {
-		binding.mailbox.enqueue(message)
+	seenRecipients := map[string]struct{}{}
+	for _, recipient := range message.Recipients {
+		normalizedRecipient := strings.ToLower(strings.TrimSpace(recipient))
+		if normalizedRecipient == "" {
+			continue
+		}
+		if _, exists := seenRecipients[normalizedRecipient]; exists {
+			continue
+		}
+		seenRecipients[normalizedRecipient] = struct{}{}
+		perRecipient := message
+		perRecipient.Address = normalizedRecipient
+		for _, binding := range c.matchBindings(perRecipient.Address) {
+			binding.mailbox.enqueue(perRecipient)
+		}
 	}
 }
 
@@ -795,6 +785,17 @@ func (c *Client) matchBindings(address string) []*mailBinding {
 	}
 	c.mu.RLock()
 	chain := append([]*mailBinding(nil), c.bindings[suffix]...)
+	if len(chain) == 0 {
+		ownerUsername := strings.ToLower(strings.TrimSpace(c.ownerUsername))
+		if ownerUsername != "" {
+			rootSuffix := strings.ToLower(string(SuffixLinuxdoSpace))
+			legacyNamespace := ownerUsername + "." + rootSuffix
+			canonicalMailNamespace := ownerUsername + "-mail." + rootSuffix
+			if suffix == legacyNamespace {
+				chain = append([]*mailBinding(nil), c.bindings[canonicalMailNamespace]...)
+			}
+		}
+	}
 	c.mu.RUnlock()
 
 	out := make([]*mailBinding, 0, len(chain))
@@ -810,15 +811,33 @@ func (c *Client) matchBindings(address string) []*mailBinding {
 	return out
 }
 
-func (c *Client) registerBinding(binding *mailBinding) {
+func (c *Client) registerBinding(binding *mailBinding) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.bindings[binding.suffix] = append(c.bindings[binding.suffix], binding)
+	c.mu.Unlock()
+
+	if err := c.syncRemoteMailboxFilters(true); err != nil {
+		c.mu.Lock()
+		chain := c.bindings[binding.suffix]
+		filtered := chain[:0]
+		for _, current := range chain {
+			if current != binding {
+				filtered = append(filtered, current)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(c.bindings, binding.suffix)
+		} else {
+			c.bindings[binding.suffix] = filtered
+		}
+		c.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (c *Client) unregisterMailbox(mailbox *Mailbox) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for suffix, chain := range c.bindings {
 		filtered := chain[:0]
 		for _, binding := range chain {
@@ -832,6 +851,8 @@ func (c *Client) unregisterMailbox(mailbox *Mailbox) {
 		}
 		c.bindings[suffix] = filtered
 	}
+	c.mu.Unlock()
+	_ = c.syncRemoteMailboxFilters(false)
 }
 
 func (c *Client) handleReadyEvent(event streamEvent) error {
@@ -843,26 +864,184 @@ func (c *Client) handleReadyEvent(event streamEvent) error {
 	c.mu.Lock()
 	c.ownerUsername = ownerUsername
 	c.mu.Unlock()
+	if err := c.syncRemoteMailboxFilters(true); err != nil {
+		return err
+	}
+	c.signalInitialReady(true, nil)
 	return nil
 }
 
-func (c *Client) resolveBindingSuffix(suffix Suffix) (string, error) {
-	normalizedSuffix := strings.ToLower(strings.TrimSpace(string(suffix)))
-	if normalizedSuffix == "" {
-		return "", errors.New("suffix must not be empty")
+func (c *Client) signalInitialReady(ok bool, err error) {
+	c.mu.Lock()
+	if c.initialReadyOK || c.initialErr != nil {
+		c.mu.Unlock()
+		return
 	}
-	if normalizedSuffix != strings.ToLower(string(SuffixLinuxdoSpace)) {
+	if ok {
+		c.initialReadyOK = true
+	} else if err != nil {
+		c.initialErr = err
+	}
+	ch := c.initialReadyCh
+	c.initialReadyCh = nil
+	c.mu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func (c *Client) resolveBindingSuffix(suffix any) (string, error) {
+	switch current := suffix.(type) {
+	case Suffix:
+		normalizedSuffix := strings.ToLower(strings.TrimSpace(string(current)))
+		if normalizedSuffix == "" {
+			return "", errors.New("suffix must not be empty")
+		}
+		if normalizedSuffix != strings.ToLower(string(SuffixLinuxdoSpace)) {
+			return normalizedSuffix, nil
+		}
+		ownerUsername := c.currentOwnerUsername()
+		if ownerUsername == "" {
+			return "", errors.New("stream bootstrap did not provide owner_username required to resolve SuffixLinuxdoSpace")
+		}
+		return ownerUsername + "-mail." + normalizedSuffix, nil
+	case SemanticSuffix:
+		normalizedBase := strings.ToLower(strings.TrimSpace(string(current.base)))
+		if normalizedBase == "" {
+			return "", errors.New("suffix must not be empty")
+		}
+		if normalizedBase != strings.ToLower(string(SuffixLinuxdoSpace)) {
+			return normalizedBase, nil
+		}
+		ownerUsername := c.currentOwnerUsername()
+		if ownerUsername == "" {
+			return "", errors.New("stream bootstrap did not provide owner_username required to resolve SuffixLinuxdoSpace.WithSuffix(...)")
+		}
+		fragment, err := normalizeMailSuffixFragment(current.mailSuffixFragment)
+		if err != nil {
+			return "", err
+		}
+		return ownerUsername + "-mail" + fragment + "." + normalizedBase, nil
+	case string:
+		normalizedSuffix := strings.ToLower(strings.TrimSpace(current))
+		if normalizedSuffix == "" {
+			return "", errors.New("suffix must not be empty")
+		}
 		return normalizedSuffix, nil
+	default:
+		return "", fmt.Errorf("unsupported suffix type %T", suffix)
+	}
+}
+
+func (c *Client) currentOwnerUsername() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return strings.ToLower(strings.TrimSpace(c.ownerUsername))
+}
+
+func (c *Client) syncRemoteMailboxFilters(strict bool) error {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return nil
+	}
+	ownerUsername := strings.ToLower(strings.TrimSpace(c.ownerUsername))
+	previous := slices.Clone(c.filterSuffixes)
+	alreadySynced := c.filtersSynced
+	c.mu.RUnlock()
+
+	if ownerUsername == "" {
+		return nil
 	}
 
-	c.mu.RLock()
-	ownerUsername := c.ownerUsername
-	c.mu.RUnlock()
-	ownerUsername = strings.ToLower(strings.TrimSpace(ownerUsername))
-	if ownerUsername == "" {
-		return "", errors.New("stream bootstrap did not provide owner_username required to resolve SuffixLinuxdoSpace")
+	fragments := c.collectRemoteMailboxSuffixFragments(ownerUsername)
+	if len(fragments) == 0 && !alreadySynced {
+		return nil
 	}
-	return ownerUsername + "." + normalizedSuffix, nil
+	if alreadySynced && slices.Equal(previous, fragments) {
+		return nil
+	}
+
+	payload, err := json.Marshal(map[string][]string{
+		"suffixes": fragments,
+	})
+	if err != nil {
+		if strict {
+			return &StreamError{Message: "failed to encode remote mailbox filter sync payload", Cause: err}
+		}
+		return nil
+	}
+
+	requestContext, cancel := context.WithTimeout(context.Background(), c.connectTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestContext, http.MethodPut, c.baseURL+streamFiltersPath, bytes.NewReader(payload))
+	if err != nil {
+		if strict {
+			return &StreamError{Message: "failed to build remote mailbox filter sync request", Cause: err}
+		}
+		return nil
+	}
+	request.Header.Set("Authorization", "Bearer "+c.token)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		if strict {
+			return &StreamError{Message: "failed to synchronize remote mailbox filters", Cause: err}
+		}
+		return nil
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		if strict {
+			return &StreamError{
+				Message: fmt.Sprintf("unexpected mailbox filter sync status code: %d", response.StatusCode),
+				Cause:   errors.New(strings.TrimSpace(string(body))),
+			}
+		}
+		return nil
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+
+	c.mu.Lock()
+	c.filtersSynced = true
+	c.filterSuffixes = slices.Clone(fragments)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) collectRemoteMailboxSuffixFragments(ownerUsername string) []string {
+	rootSuffix := strings.ToLower(string(SuffixLinuxdoSpace))
+	canonicalPrefix := ownerUsername + "-mail"
+	fragmentsSet := map[string]struct{}{}
+
+	c.mu.RLock()
+	suffixes := make([]string, 0, len(c.bindings))
+	for suffix := range c.bindings {
+		suffixes = append(suffixes, suffix)
+	}
+	c.mu.RUnlock()
+
+	for _, suffix := range suffixes {
+		normalizedSuffix := strings.ToLower(strings.TrimSpace(suffix))
+		if !strings.HasSuffix(normalizedSuffix, "."+rootSuffix) {
+			continue
+		}
+		label := strings.TrimSuffix(normalizedSuffix, "."+rootSuffix)
+		if strings.Contains(label, ".") || !strings.HasPrefix(label, canonicalPrefix) {
+			continue
+		}
+		fragmentsSet[label[len(canonicalPrefix):]] = struct{}{}
+	}
+
+	fragments := make([]string, 0, len(fragmentsSet))
+	for fragment := range fragmentsSet {
+		fragments = append(fragments, fragment)
+	}
+	slices.Sort(fragments)
+	return fragments
 }
 
 func (c *Client) isClosed() bool {
@@ -915,18 +1094,18 @@ func normalizeBaseURL(baseURL string) (string, error) {
 	return normalized, nil
 }
 
-func parseMailEvent(event streamEvent) ([]MailMessage, error) {
+func parseMailEvent(event streamEvent) (MailMessage, error) {
 	encoded := strings.TrimSpace(event.RawMessageBase64)
 	if encoded == "" {
-		return nil, &StreamError{Message: "mail event did not include raw_message_base64"}
+		return MailMessage{}, &StreamError{Message: "mail event did not include raw_message_base64"}
 	}
 	rawBytes, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, &StreamError{Message: "mail event contained invalid base64 message data", Cause: err}
+		return MailMessage{}, &StreamError{Message: "mail event contained invalid base64 message data", Cause: err}
 	}
 	receivedAt, err := time.Parse(time.RFC3339, strings.TrimSpace(event.ReceivedAt))
 	if err != nil {
-		return nil, &StreamError{Message: "invalid mail event timestamp", Cause: err}
+		return MailMessage{}, &StreamError{Message: "invalid mail event timestamp", Cause: err}
 	}
 
 	parsed, parseErr := mail.ReadMessage(bytes.NewReader(rawBytes))
@@ -969,36 +1148,32 @@ func parseMailEvent(event streamEvent) ([]MailMessage, error) {
 	}
 
 	recipients := normalizeRecipients(event.OriginalRecipients)
-	if len(recipients) == 0 {
-		recipients = []string{""}
+	primaryAddress := ""
+	if len(recipients) > 0 {
+		primaryAddress = recipients[0]
 	}
-
-	out := make([]MailMessage, 0, len(recipients))
-	for _, recipient := range recipients {
-		out = append(out, MailMessage{
-			Address:          recipient,
-			Sender:           strings.TrimSpace(event.OriginalEnvelopeFrom),
-			Recipients:       append([]string(nil), recipients...),
-			ReceivedAt:       receivedAt,
-			Subject:          subject,
-			MessageID:        messageID,
-			Date:             dateValue,
-			FromHeader:       fromHeader,
-			ToHeader:         toHeader,
-			CcHeader:         ccHeader,
-			ReplyToHeader:    replyToHeader,
-			FromAddresses:    append([]string(nil), fromAddresses...),
-			ToAddresses:      append([]string(nil), toAddresses...),
-			CcAddresses:      append([]string(nil), ccAddresses...),
-			ReplyToAddresses: append([]string(nil), replyToAddresses...),
-			Text:             textBody,
-			HTML:             htmlBody,
-			Headers:          copyStringMap(headers),
-			Raw:              string(rawBytes),
-			RawBytes:         append([]byte(nil), rawBytes...),
-		})
-	}
-	return out, nil
+	return MailMessage{
+		Address:          primaryAddress,
+		Sender:           strings.TrimSpace(event.OriginalEnvelopeFrom),
+		Recipients:       append([]string(nil), recipients...),
+		ReceivedAt:       receivedAt,
+		Subject:          subject,
+		MessageID:        messageID,
+		Date:             dateValue,
+		FromHeader:       fromHeader,
+		ToHeader:         toHeader,
+		CcHeader:         ccHeader,
+		ReplyToHeader:    replyToHeader,
+		FromAddresses:    append([]string(nil), fromAddresses...),
+		ToAddresses:      append([]string(nil), toAddresses...),
+		CcAddresses:      append([]string(nil), ccAddresses...),
+		ReplyToAddresses: append([]string(nil), replyToAddresses...),
+		Text:             textBody,
+		HTML:             htmlBody,
+		Headers:          copyStringMap(headers),
+		Raw:              string(rawBytes),
+		RawBytes:         append([]byte(nil), rawBytes...),
+	}, nil
 }
 
 func normalizeRecipients(in []string) []string {
